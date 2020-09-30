@@ -1,8 +1,11 @@
 import torch
 import torch.nn as nn
 from .utils import load_state_dict_from_url
-from .switchable_ops import SwitchableBatchNorm2d, replicate_SBN_params, remap_BN
+from .switchable_ops import SwitchableBatchNorm2d
 from .quantized_ops import QuantizedConv2d
+from torch.distributions import Categorical
+import torch.nn.functional as F
+import random
 
 # They can be set main.py
 Conv2d = QuantizedConv2d
@@ -122,6 +125,20 @@ class Bottleneck(nn.Module):
         return out
 
 
+class DQN(nn.Module):
+    def __init__(self, in_channels=1, d_hidden=10, actions=6, num_layers=19):
+        super(DQN, self).__init__()
+        self.fc = nn.Sequential(nn.Linear(in_channels, d_hidden),
+                                nn.BatchNorm2d(d_hidden),
+                                nn.ReLU(),
+                                nn.Linear(d_hidden, actions * num_layers))
+
+    def forward(self, x):
+        x = self.fc(x)
+        x = x.view(-1, self.num_layers, self.actions)
+        return x
+
+
 class ResNet(nn.Module):
 
     def __init__(self, block, layers, num_classes=1000, zero_init_residual=False,
@@ -129,7 +146,7 @@ class ResNet(nn.Module):
                  norm_layer=None):
         super(ResNet, self).__init__()
         if norm_layer is None:
-            norm_layer = SwitchableBatchNorm2d
+            norm_layer = nn.BatchNorm2d
         self._norm_layer = norm_layer
 
         self.inplanes = 64
@@ -147,7 +164,7 @@ class ResNet(nn.Module):
             self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=3, stride=1, padding=1, bias=False)
         else:
             self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(self.inplanes)
+        self.bn1 = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
@@ -225,18 +242,10 @@ def _resnet(arch, block, layers, pretrained, progress, **kwargs):
     if pretrained:
         state_dict = load_state_dict_from_url(model_urls[arch],
                                               progress=progress)
-
-        if kwargs['num_classes'] != 1000:
+        if kwargs['num_classes'] == 200:
             state_dict.pop('fc.weight')
             state_dict.pop('fc.bias')
-        if kwargs['num_classes'] == 200:
-            state_dict.pop('conv1.weight')
-
-        # Load pretrained considering SBN
-        state_dict = remap_BN(state_dict)
         model.load_state_dict(state_dict, strict=False)
-        replicate_SBN_params(model)
-
     return model
 
 
