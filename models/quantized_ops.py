@@ -104,7 +104,7 @@ class QuantizedConv2d_batch(nn.Conv2d):
                                         stride=stride, padding=padding,
                                         dilation=dilation, groups=groups, bias=bias)
 
-        self.clip = Parameter(torch.Tensor([1]))
+        # self.clip = Parameter(torch.Tensor([1]))
         self.bitA = None
         self.bitW = None
 

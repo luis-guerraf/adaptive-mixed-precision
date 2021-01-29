@@ -19,6 +19,29 @@ class SwitchableBatchNorm2d(nn.Module):
         return y
 
 
+class SwitchableBatchNorm2d_batch(nn.Module):
+    def __init__(self, num_features):
+        super(SwitchableBatchNorm2d_batch, self).__init__()
+        bns = []
+        for _ in range(switches):
+            bns.append(nn.BatchNorm2d(num_features))
+        self.bn = nn.ModuleList(bns)
+        self.switch = 0
+        self.id = None
+
+    def forward(self, input):
+        output = torch.zeros(input.size(), dtype=input.dtype, device=input.device)
+
+        # This for loop runs in parallel in the gpu
+        for elem in torch.unique(self.switch):
+            mask = self.switch == elem
+            _input = input[mask]
+            res = self.bn[elem](_input)
+            output[mask] = res
+
+        return output
+
+
 def remap_BN(state_dict):
     temp_resnet = {}
     for k in state_dict.keys():

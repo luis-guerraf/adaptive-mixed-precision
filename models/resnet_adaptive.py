@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 from .utils import load_state_dict_from_url
 from .quantized_ops import QuantizedConv2d_batch
-from .switchable_ops import SwitchableBatchNorm2d
-from .policy import Policy_RNN_continous as Policy
+from .switchable_ops import SwitchableBatchNorm2d_batch
+from .policy import Policy_CNN_continous_whole as Policy
 
 # They can be set main.py
 Conv2d = QuantizedConv2d_batch
@@ -130,7 +130,7 @@ class ResNet(nn.Module):
                  norm_layer=None):
         super(ResNet, self).__init__()
         if norm_layer is None:
-            norm_layer = SwitchableBatchNorm2d
+            norm_layer = SwitchableBatchNorm2d_batch
         self._norm_layer = norm_layer
 
         self.inplanes = 64
@@ -152,7 +152,7 @@ class ResNet(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        self.precision_selector = Policy()
+        self.policy = Policy()
 
         self.layer1 = self._make_layer(block, 64, layers[0])
         self.layer2 = self._make_layer(block, 128, layers[1], stride=2,
@@ -164,7 +164,7 @@ class ResNet(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = Linear(512 * block.expansion, num_classes)
 
-        self.convs = convs_list(self)
+        self.BNs, self.convs = layers_list(self)
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -215,13 +215,13 @@ class ResNet(nn.Module):
 
         if eightbit:
             ones = torch.ones((x.size(0), 19), dtype=torch.int32, device=x.device)
-            ones *= 8
-            precision = (ones, ones)
+            precision = (ones*8, ones*2)
             log_probs = None
             entropies = None
         else:
-            precision, log_probs, entropies = self.precision_selector(x)
-        self.configure_model(precision, self.convs)
+            precision, log_probs, entropies = self.policy(x)
+            precision[1].fill_(2)
+        self.configure_model(precision)
 
         x = self.layer1(x)
         x = self.layer2(x)
@@ -234,16 +234,20 @@ class ResNet(nn.Module):
 
         return x, precision, log_probs, entropies
 
-    def configure_model(self, bits, convs):
+    def configure_model(self, bits):
         bit_a, bit_w = bits
-        for i, conv in enumerate(convs):
+        for i, (conv, bn) in enumerate(zip(self.convs, self.BNs)):
             conv.bitA = bit_a[:, i]
             conv.bitW = bit_w[:, i]
+            bn.switch = bit_a[:, i] - 2         # Switches range is 0-6, bitwidths range is 2-8
 
 
-def convs_list(model):
+# Create list with conv2d
+# NOTE: Make sure layers are declared in order in the model
+def layers_list(model):
+    BNs = list(filter(lambda x: isinstance(x, SwitchableBatchNorm2d_batch), [i for i in model.modules()]))
     convs = list(filter(lambda x: isinstance(x, QuantizedConv2d_batch), [i for i in model.modules()]))
-    return convs
+    return BNs, convs
 
 
 def _resnet(arch, block, layers, progress, **kwargs):

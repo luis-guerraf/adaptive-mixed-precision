@@ -21,7 +21,7 @@ import models
 from utils.model_profiling import model_profiling
 from PIL import Image
 import numpy as np
-import torch.nn.utils as utils
+# import matplotlib.pyplot as plt
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -75,7 +75,7 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 
-alpha = 0.01
+alpha = 0.1
 best_acc1 = 0
 args = None
 
@@ -138,7 +138,7 @@ def main_worker(gpu, ngpus_per_node, args):
     # create model
     num_classes = 1000 if args.dataset == 'imagenet' else 200
     print("=> creating model '{}'".format(args.arch))
-    model = models.resnet_adaptive.__dict__[args.arch](num_classes=num_classes)
+    model = models.resnet_adaptive_layerwise.__dict__[args.arch](num_classes=num_classes)
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -177,7 +177,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # Freeze main network
     model.apply(freeze_weights)
-    model._modules['module'].precision_selector.apply(unfreeze_weights)
+    model._modules['module'].policy.apply(unfreeze_weights)
 
     # Only freezing the gradients will still update the running mean and var of the batch norms
     # optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.parameters()),
@@ -210,12 +210,18 @@ def main_worker(gpu, ngpus_per_node, args):
             elif 'sandwich_a.tar' in args.resume:
                 # models.switchable_ops.switches = 3
                 model.load_state_dict(checkpoint['state_dict'], strict=False)
+                SBNs, _ = layers_list(model)
+                for SBN in SBNs:
+                    plot_bn_params(SBN)
             elif 'sandwich_w_a.tar' in args.resume:
                 # models.switchable_ops.switches = 9
                 model.load_state_dict(checkpoint['state_dict'], strict=False)
-            else:
+            elif 'checkpoint_adaptive' in args.resume:
                 model.load_state_dict(checkpoint['state_dict'], strict=True)
                 optimizer.load_state_dict(checkpoint['optimizer'])
+            else:
+                model.load_state_dict(checkpoint['state_dict'], strict=False)
+                # optimizer.load_state_dict(checkpoint['optimizer'])
 
             print("=> loaded checkpoint '{}' (epoch: {} acc1: {:0.2f})"
                   .format(args.resume, checkpoint['epoch'], checkpoint['best_acc1']))
@@ -276,7 +282,7 @@ def main_worker(gpu, ngpus_per_node, args):
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
-        train(train_loader, model, criterion, criterion_RL, optimizer, epoch, args)
+        train(train_loader, model, criterion_RL, optimizer, epoch, args)
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, epoch, args)
@@ -299,18 +305,15 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best)
 
 
-def train(train_loader, model, criterion, criterion_RL, optimizer, epoch, args):
-    batch_time = [AverageMeter('Time', ':6.3f'), AverageMeter('Time', ':6.3f')]
-    losses = [AverageMeter('Loss', ':.2e'), AverageMeter('Loss', ':.2e')]
-    top1 = [AverageMeter('Acc@1', ':6.2f'), AverageMeter('Acc@1', ':6.2f')]
-    top5 = [AverageMeter('Acc@5', ':6.2f'), AverageMeter('Acc@5', ':6.2f')]
-    bitwidth_a = [AverageMeter('Bit_a', ':1.2f'), AverageMeter('Bit_a', ':1.2f')]
-    bitwidth_w = [AverageMeter('Bit_w', ':1.2f'), AverageMeter('Bit_w', ':1.2f')]
-    progress = [ProgressMeter(len(train_loader), [batch_time[0], losses[0], top1[0], top5[0], bitwidth_a[0], bitwidth_w[0]],
-                                                    "Epoch: [{}]\t".format(epoch)),
-                ProgressMeter(len(train_loader), [batch_time[1], losses[1], top1[1], top5[1], bitwidth_a[1], bitwidth_w[1]],
-                              "Epoch: [{}]\t".format(epoch))]
-    bns, _ = layers_list(model)
+def train(train_loader, model, criterion_RL, optimizer, epoch, args):
+    batch_time = AverageMeter('Time', ':6.3f')
+    losses = AverageMeter('Loss', ':.2e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    bitwidth_a = AverageMeter('Bit_a', ':1.2f')
+    bitwidth_w = AverageMeter('Bit_w', ':1.2f')
+    progress = ProgressMeter([batch_time, losses, top1, top5, bitwidth_a, bitwidth_w],
+                                                    "Epoch: [{}]\t".format(epoch))
 
     # switch to train mode
     model.train()
@@ -321,45 +324,38 @@ def train(train_loader, model, criterion, criterion_RL, optimizer, epoch, args):
         if torch.cuda.is_available():
             target = target.cuda(args.gpu, non_blocking=True)
 
-        for switch in [8]:
-            # Switch 4 is 8bit-8bit
-            eightbit = 1 if switch == 4 else 0
+        end = time.time()
 
-            # Configure model
-            list(map(lambda bn: setattr(bn, 'switch', switch), bns))
-            end = time.time()
+        output, (precision, log_probs, entropies) = model(images, eightbit=False)
 
-            output, precision, log_probs, entropies = model(images, eightbit)
+        # loss = criterion(output, target)
+        policy_loss = loss_RL(criterion_RL(output, target), precision, log_probs, entropies)
+        loss = policy_loss
 
-            # loss = criterion(output, target)
-            policy_loss = loss_RL(criterion_RL(output, target), precision, log_probs, entropies, eightbit)
-            loss = policy_loss*0.01
+        # PACT_L2_loss = list(map(pact_l2_loss, convs))
+        # PACT_L2_loss = sum(PACT_L2_loss) / len(PACT_L2_loss)
+        # loss += PACT_L2_loss*0.01
 
-            # PACT_L2_loss = list(map(pact_l2_loss, convs))
-            # PACT_L2_loss = sum(PACT_L2_loss) / len(PACT_L2_loss)
-            # loss += PACT_L2_loss*0.01
+        # Optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-            # Optimize
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
+        bitwidth_a.update(precision[0].double().mean(), images.size(0))
+        bitwidth_w.update(precision[1].double().mean(), images.size(0))
 
-            # measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            losses[eightbit].update(loss.item(), images.size(0))
-            top1[eightbit].update(acc1[0], images.size(0))
-            top5[eightbit].update(acc5[0], images.size(0))
-            bitwidth_a[eightbit].update(precision[0].double().mean(), images.size(0))
-            bitwidth_w[eightbit].update(precision[1].double().mean(), images.size(0))
+        # measure elapsed time
+        batch_time.update(time.time() - end)
 
-            # measure elapsed time
-            batch_time[eightbit].update(time.time() - end)
+        # if epoch == 21:
+        #     select_examples(images, precision)
 
-            # if epoch == 21:
-            #     select_examples(images, precision)
-
-    progress[0].display(i)
-    progress[1].display(i)
+    progress.display()
 
 
 def validate(val_loader, model, criterion, epoch, args):
@@ -369,11 +365,10 @@ def validate(val_loader, model, criterion, epoch, args):
     top5 = [AverageMeter('Acc@5', ':6.2f'), AverageMeter('Acc@5', ':6.2f')]
     bitwidth_a = [AverageMeter('Bit_a', ':1.2f'), AverageMeter('Bit_a', ':1.2f')]
     bitwidth_w = [AverageMeter('Bit_w', ':1.2f'), AverageMeter('Bit_w', ':1.2f')]
-    progress = [ProgressMeter(len(val_loader), [batch_time[0], losses[0], top1[0], top5[0], bitwidth_a[0], bitwidth_w[0]],
+    progress = [ProgressMeter([batch_time[0], losses[0], top1[0], top5[0], bitwidth_a[0], bitwidth_w[0]],
                                                     "Epoch: [{}]\t".format(epoch)),
-                ProgressMeter(len(val_loader), [batch_time[1], losses[1], top1[1], top5[1], bitwidth_a[1], bitwidth_w[1]],
+                ProgressMeter([batch_time[1], losses[1], top1[1], top5[1], bitwidth_a[1], bitwidth_w[1]],
                               "Epoch: [{}]\t".format(epoch))]
-    bns, _ = layers_list(model)
 
     # switch to evaluate mode
     model.eval()
@@ -386,15 +381,9 @@ def validate(val_loader, model, criterion, epoch, args):
             if torch.cuda.is_available():
                 target = target.cuda(args.gpu, non_blocking=True)
 
-            for switch in [4, 8]:
-                # Switch [4] is 8bit-8bit. Switch [8] is random-random
-                eightbit = 1 if switch == 4 else 0
-
-                # Configure model
-                list(map(lambda bn: setattr(bn, 'switch', switch), bns))
-
+            for eightbit in [0, 1]:
                 # compute output
-                output, precision, _, _ = model(images, eightbit)
+                output, (precision, _, _) = model(images, eightbit)
 
                 loss = criterion(output, target)
 
@@ -410,17 +399,17 @@ def validate(val_loader, model, criterion, epoch, args):
                 batch_time[eightbit].update(time.time() - end)
                 end = time.time()
 
-        progress[0].display(i)
-        progress[1].display(i)
+        progress[0].display()
+        progress[1].display()
 
     return top1[0].avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, filename='checkpoint_adaptive.pth.tar'):
     filename = 'pretrained/' + filename
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'pretrained/model_best.pth.tar')
+        shutil.copyfile(filename, 'pretrained/model_best_adaptive.pth.tar')
 
 
 class AverageMeter(object):
@@ -448,20 +437,14 @@ class AverageMeter(object):
 
 
 class ProgressMeter(object):
-    def __init__(self, num_batches, meters, prefix=""):
-        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
+    def __init__(self, meters, prefix=""):
         self.meters = meters
         self.prefix = prefix
 
-    def display(self, batch):
-        entries = [self.prefix + self.batch_fmtstr.format(batch)]
+    def display(self):
+        entries = [self.prefix]
         entries += [str(meter) for meter in self.meters]
         print('\t'.join(entries))
-
-    def _get_batch_fmtstr(self, num_batches):
-        num_digits = len(str(num_batches // 1))
-        fmt = '{:' + str(num_digits) + 'd}'
-        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
 
 def adjust_learning_rate(optimizer, epoch, args):
@@ -495,14 +478,6 @@ def accuracy(output, target, topk=(1,)):
         return res
 
 
-# Create list with conv2d
-# NOTE: Make sure layers are declared in order in the model
-def layers_list(model):
-    BNs = list(filter(lambda x: isinstance(x, models.switchable_ops.SwitchableBatchNorm2d), [i for i in model.modules()]))
-    convs = list(filter(lambda x: isinstance(x, nn.Conv2d), [i for i in model.modules()]))
-    return BNs, convs
-
-
 def pact_l2_loss(layer):
     if layer.__class__.__name__ == 'QuantizedConv2d':
         return layer.clip[0]
@@ -511,10 +486,8 @@ def pact_l2_loss(layer):
 
 
 control_variate = None
-def loss_RL(batch_loss, precision, log_probs, entropies, eightbit):
+def loss_RL(batch_loss, precision, log_probs, entropies):
     global control_variate
-    if eightbit:
-        return 0
 
     gamma = 1.0
     upper = 8
@@ -527,8 +500,7 @@ def loss_RL(batch_loss, precision, log_probs, entropies, eightbit):
     discounts.reverse()
     beta = alpha / num_layers
 
-    control_variate = batch_loss.mean() if control_variate == None \
-        else control_variate * 0.9 + batch_loss.mean() * 0.1
+    control_variate = control_variate*0.9 + batch_loss.mean()*0.1 if control_variate else batch_loss.mean()
     temp = batch_loss.detach() - control_variate.detach()
     for layer in range(num_layers-1, 0, -1):
         # Reward from activations
@@ -537,9 +509,9 @@ def loss_RL(batch_loss, precision, log_probs, entropies, eightbit):
         policy_loss.append(log_probs[0][:, layer] * r_i - entropies[0][:, layer]*0.01)
 
         # Reward from weights
-        R_w = (upper - precision[1][:, layer]) * cost_w[layer]
-        r_i = temp - (beta * R_w.float() * discounts[layer])
-        policy_loss.append(log_probs[1][:, layer] * r_i - entropies[1][:, layer]*0.01)
+        # R_w = (upper - precision[1][:, layer]) * cost_w[layer]
+        # r_i = temp - (beta * R_w.float() * discounts[layer])
+        # policy_loss.append(log_probs[1][:, layer] * r_i - entropies[1][:, layer]*0.01)
 
     policy_loss = torch.cat(policy_loss).mean()
 
@@ -591,7 +563,7 @@ def select_examples(images, precision):
 
 
 def set_up():
-    models.switchable_ops.switches = 9
+    models.switchable_ops.switches = 7
     pass
 
 
@@ -603,6 +575,15 @@ def freeze_weights(layer):
 def unfreeze_weights(layer):
     for param in layer.parameters():
         param.requires_grad = True
+
+
+def plot_bn_params(SBN):
+    fig, axs = plt.subplots(2, 2)
+    for bn in SBN.bn:
+        axs[0, 0].plot(bn.weight.cpu().numpy())
+        axs[0, 1].plot(bn.bias.cpu().numpy())
+        axs[1, 0].plot(bn.running_mean.cpu().numpy())
+        axs[1, 1].plot(bn.running_var.cpu().numpy())
 
 
 if __name__ == '__main__':

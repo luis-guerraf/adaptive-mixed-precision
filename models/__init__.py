@@ -1,4 +1,5 @@
 from .resnet_adaptive import *
+from .resnet_adaptive_layerwise import *
 # from .resnet_nas import *
 from .resnet import *
 from .mobilenet import *

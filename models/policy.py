@@ -19,7 +19,7 @@ def conv_dw(inp, oup, stride):
 
 
 class Policy_CNN(nn.Module):
-    def __init__(self, hidden_dim=10, actions=6, num_layers=19, in_channels=64):
+    def __init__(self, hidden_dim=10, actions=7, num_layers=19, in_channels=64):
         super(Policy_CNN, self).__init__()
         self.actions = actions
         self.num_layers = num_layers
@@ -57,7 +57,7 @@ class Policy_CNN(nn.Module):
 
 # Predict one layer at a time, taking into account the previous layers
 class Policy_RNN(nn.Module):
-    def __init__(self, hidden_dim=10, actions=6, num_layers=19, in_channels=64):
+    def __init__(self, hidden_dim=10, actions=7, num_layers=19, in_channels=64):
         super(Policy_RNN, self).__init__()
         self.actions = actions
         self.hidden_dim = hidden_dim
@@ -197,22 +197,32 @@ class Policy_CNN_continous(nn.Module):
 
 
 class Policy_RNN_continous(nn.Module):
-    def __init__(self, hidden_dim=10, actions=6, num_layers=19, in_channels=64):
+    def __init__(self, hidden_dim=10, num_layers=19, in_channels=64):
         super(Policy_RNN_continous, self).__init__()
-        self.actions = actions
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.lstm_layers = 2
 
+        # self.LSTM = nn.LSTM(hidden_dim + 2, hidden_dim, self.lstm_layers)
         self.LSTM = nn.LSTM(hidden_dim + 2, hidden_dim, self.lstm_layers)
         self.hidden2mu = nn.Linear(hidden_dim, 1*2)
         self.hidden2var = nn.Linear(hidden_dim, 1*2)
+        self.regressor = nn.Linear(1024, hidden_dim)
 
         self.reduce = nn.Sequential(
-            conv_dw(in_channels, hidden_dim, 2),
-            conv_dw(hidden_dim, hidden_dim, 2),
-            conv_dw(hidden_dim, hidden_dim, 2),
-            conv_dw(hidden_dim, hidden_dim, 2),
+            conv_dw(in_channels, 64, 1),
+            conv_dw(64, 128, 2),
+            conv_dw(128, 128, 1),
+            conv_dw(128, 256, 2),
+            conv_dw(256, 256, 1),
+            conv_dw(256, 512, 2),
+            conv_dw(512, 512, 1),
+            conv_dw(512, 512, 1),
+            conv_dw(512, 512, 1),
+            conv_dw(512, 512, 1),
+            conv_dw(512, 512, 1),
+            conv_dw(512, 1024, 2),
+            conv_dw(1024, 1024, 1),
             nn.AdaptiveAvgPool2d((1, 1))
         )
 
@@ -231,6 +241,7 @@ class Policy_RNN_continous(nn.Module):
 
         x = self.reduce(x)
         x = torch.flatten(x, 1)
+        x = self.regressor(x)
 
         # Init hidden state vectors with zeros
         hidden = self.init_hidden(batch_size)
@@ -297,3 +308,170 @@ class Policy_RNN_continous(nn.Module):
 
         return (bit_a + 2, bit_w + 2), (log_probs_a, log_probs_w), (entropies_a, entropies_w)
 
+
+class Policy_RNN_continous_layerwise(nn.Module):
+    def __init__(self, hidden_dim=10, num_layers=19, in_channels=[]):
+        super(Policy_RNN_continous_layerwise, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.lstm_layers = 2
+
+        self.LSTM = nn.LSTM(hidden_dim, hidden_dim, self.lstm_layers)
+        self.hidden2mu = nn.Linear(hidden_dim, 1)
+        self.hidden2var = nn.Linear(hidden_dim, 1)
+
+        self.layer = 0
+        reduce = []
+        for c in in_channels:
+            reduce.append(nn.Sequential(
+                nn.AdaptiveAvgPool2d(3),
+                nn.Conv2d(in_channels=c, out_channels=hidden_dim, kernel_size=3, stride=1),
+                nn.ReLU(),
+                nn.BatchNorm2d(hidden_dim),
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=1, stride=1)
+                )
+            )
+        self.reduce = nn.ModuleList(reduce)
+
+        # Initialize bitwidth vectors and log_probs
+        self.bit_a = torch.empty(0, dtype=torch.int64).cuda()
+        self.log_probs_a = torch.empty(0, dtype=torch.float32).cuda()
+        self.entropies_a = torch.empty(0, dtype=torch.float32).cuda()
+        self.bit_w = torch.empty(0, dtype=torch.int64).cuda()
+        self.log_probs_w = torch.empty(0, dtype=torch.float32).cuda()
+        self.entropies_w = torch.empty(0, dtype=torch.float32).cuda()
+
+        self.hidden = None
+
+    def init_hidden(self, batch_size):
+        return (torch.zeros(self.lstm_layers, batch_size, self.hidden_dim, requires_grad=True).cuda(),
+                torch.zeros(self.lstm_layers, batch_size, self.hidden_dim, requires_grad=True).cuda())
+
+    def init_vectors(self):
+        self.bit_a = torch.empty(0, dtype=torch.int64).cuda()
+        self.log_probs_a = torch.empty(0, dtype=torch.float32).cuda()
+        self.entropies_a = torch.empty(0, dtype=torch.float32).cuda()
+        self.bit_w = torch.empty(0, dtype=torch.int64).cuda()
+        self.log_probs_w = torch.empty(0, dtype=torch.float32).cuda()
+        self.entropies_w = torch.empty(0, dtype=torch.float32).cuda()
+
+    def discretize(self, x):
+        x[x < 0] = 0
+        x[x > 6] = 6
+        x = x.round().long()
+        return x
+
+    def forward(self, input):
+        x, downsample, eightbit = input
+        batch_size = x.size(0)
+
+        x = self.reduce[self.layer](x)
+        x = x.squeeze()
+
+        if self.layer == 0:
+            # Init hidden state vectors with zeros
+            self.hidden = self.init_hidden(batch_size)
+            self.init_vectors()
+            self.LSTM.flatten_parameters()
+
+        # Loop through layers
+        out, self.hidden = self.LSTM(x.view(1, batch_size, -1), self.hidden)      # Sequence is length 1
+        out = out.squeeze()
+        mu_a = F.softplus(self.hidden2mu(out)).squeeze()
+        var_a = F.softplus(self.hidden2var(out)).squeeze()
+
+        eps_a = torch.randn(mu_a.size(), dtype=mu_a.dtype, device=mu_a.device)
+
+        # Calculate the probability
+        action_a = (mu_a + var_a.sqrt() * eps_a).data
+        prob_a = normal(action_a, mu_a, var_a)
+        entropy_a = -0.5 * ((var_a + 2 * pi.expand_as(var_a)).log() + 1)
+
+        _bit_a = self.discretize(action_a)
+        if eightbit:
+            _bit_a[:] = 1
+        _bit_w = torch.zeros_like(_bit_a)
+
+
+        # Append bits and log_probs
+        self.bit_a = torch.cat((self.bit_a, _bit_a.unsqueeze(0)), dim=0)
+        self.log_probs_a = torch.cat((self.log_probs_a, prob_a.log().unsqueeze(0)), dim=0)
+        self.entropies_a = torch.cat((self.entropies_a, entropy_a.unsqueeze(0)), dim=0)
+        self.bit_w = torch.cat((self.bit_w, _bit_w.unsqueeze(0)), dim=0)
+        self.log_probs_w = self.log_probs_a.clone()
+        self.entropies_w = self.entropies_a.clone()
+
+        # Increase layer counter
+        self.layer += 1
+
+        return (_bit_a + 2, _bit_w + 2)
+
+    def get_predictions(self):
+        self.layer = 0
+
+        # Transpose bits and log_probs to correct shape
+        return (self.bit_a.t() + 2, self.bit_w.t() + 2), \
+               (self.log_probs_a.t(), self.log_probs_w.t()), \
+               (self.entropies_a.t(), self.entropies_w.t())
+
+    def configure_layer(self, conv, bn, bit):
+        conv.bitA = bit[0]
+        conv.bitW = bit[1]
+        bn.switch = bit[0] - 2         # Switches range is 0-6, bitwidths range is 2-8
+
+
+class Policy_CNN_continous_whole(nn.Module):
+    def __init__(self, hidden_dim=10, num_layers=19, in_channels=64):
+        super(Policy_CNN_continous_whole, self).__init__()
+        self.num_layers = num_layers
+
+        self.reduce = nn.Sequential(
+            conv_dw(in_channels, hidden_dim, 2),
+            conv_dw(hidden_dim, hidden_dim, 2),
+            conv_dw(hidden_dim, hidden_dim, 2),
+            conv_dw(hidden_dim, hidden_dim, 2),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+        self.hidden2mu = nn.Linear(hidden_dim, 2)         # mu_a, mu_w
+        self.hidden2var = nn.Linear(hidden_dim, 2)        # var_a, var_w
+
+    def discretize(self, x):
+        x[x < 0] = 0
+        x[x > 6] = 6
+        x = x.round().long()
+        return x
+
+    def forward(self, x):
+        x = self.reduce(x)
+        x = torch.flatten(x, 1)
+        x = self.classifier(x)
+        mu = F.softplus(self.hidden2mu(x))
+        var = F.softplus(self.hidden2var(x))
+
+        mu_a, mu_w = mu[:, 0], mu[:, 1]
+        var_a, var_w = var[:, 0], var[:, 1]
+
+        eps_a = torch.randn(mu_a.size(), dtype=mu_a.dtype, device=mu_a.device)
+        eps_w = torch.randn(mu_w.size(), dtype=mu_w.dtype, device=mu_w.device)
+
+        # Calculate the probability
+        action_a = (mu_a + var_a.sqrt() * eps_a).data
+        action_w = (mu_w + var_w.sqrt() * eps_w).data
+        probs_a = normal(action_a, mu_a, var_a)
+        probs_w = normal(action_w, mu_w, var_w)
+        entropy_a = -0.5 * ((var_a + 2 * pi.expand_as(var_a)).log() + 1)
+        entropy_w = -0.5 * ((var_w + 2 * pi.expand_as(var_w)).log() + 1)
+
+        bit_a = self.discretize(action_a)
+        bit_w = self.discretize(action_w)
+        bit_a = bit_a.unsqueeze(-1).repeat(1, self.num_layers)
+        bit_w = bit_w.unsqueeze(-1).repeat(1, self.num_layers)
+
+        return (bit_a + 2, bit_w + 2), (probs_a.log(), probs_w.log()), (entropy_a, entropy_w)
